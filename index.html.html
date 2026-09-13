@@ -1,0 +1,677 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>CPFU Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prop-types/15.8.1/prop-types.min.js"></script>
+<script src="https://unpkg.com/react-is@18.2.0/umd/react-is.production.min.js"></script>
+<script src="https://unpkg.com/recharts@2.10.3/umd/Recharts.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.23.5/babel.min.js"></script>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #0A1628; }
+  #root { min-height: 100vh; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useMemo, useCallback, useRef } = React;
+const {
+  BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend,
+  ResponsiveContainer, ReferenceLine,
+} = Recharts;
+
+// ================= tiny inline icon set (no external icon lib needed) =================
+function Icon({ name, size = 16, color = "currentColor" }) {
+  const p = { width: size, height: size, viewBox: "0 0 24 24", fill: "none", stroke: color, strokeWidth: 2, strokeLinecap: "round", strokeLinejoin: "round" };
+  switch (name) {
+    case "upload": return <svg {...p}><path d="M12 3v13" /><path d="m7 8 5-5 5 5" /><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" /></svg>;
+    case "factory": return <svg {...p}><path d="M3 21h18" /><path d="M5 21V10l6 4V10l6 4V5l4 3v13" /></svg>;
+    case "check": return <svg {...p}><circle cx="12" cy="12" r="10" /><path d="m9 12 2 2 4-4" /></svg>;
+    case "x": return <svg {...p}><circle cx="12" cy="12" r="10" /><path d="m15 9-6 6" /><path d="m9 9 6 6" /></svg>;
+    case "sliders": return <svg {...p}><line x1="4" x2="4" y1="21" y2="14" /><line x1="4" x2="4" y1="10" y2="3" /><line x1="12" x2="12" y1="21" y2="12" /><line x1="12" x2="12" y1="8" y2="3" /><line x1="20" x2="20" y1="21" y2="16" /><line x1="20" x2="20" y1="12" y2="3" /><line x1="2" x2="6" y1="14" y2="14" /><line x1="10" x2="14" y1="8" y2="8" /><line x1="18" x2="22" y1="16" y2="16" /></svg>;
+    case "rotate": return <svg {...p}><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" /><path d="M3 3v5h5" /></svg>;
+    case "chevronRight": return <svg {...p}><path d="m9 18 6-6-6-6" /></svg>;
+    case "chevronDown": return <svg {...p}><path d="m6 9 6 6 6-6" /></svg>;
+    case "fileSheet": return <svg {...p}><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><path d="M14 2v6h6" /><path d="M8 13h2" /><path d="M14 13h2" /><path d="M8 17h2" /><path d="M14 17h2" /></svg>;
+    case "arrowLeft": return <svg {...p}><path d="m12 19-7-7 7-7" /><path d="M19 12H5" /></svg>;
+    default: return null;
+  }
+}
+
+// ================= stats helpers =================
+function mean(a) { return a.reduce((s, v) => s + v, 0) / a.length; }
+function stddev(a) { const m = mean(a); return Math.sqrt(mean(a.map((v) => (v - m) ** 2))); }
+function pearson(x, y) {
+  const n = x.length;
+  const mx = mean(x), my = mean(y);
+  let sxy = 0, sxx = 0, syy = 0;
+  for (let i = 0; i < n; i++) {
+    const dx = x[i] - mx, dy = y[i] - my;
+    sxy += dx * dy; sxx += dx * dx; syy += dy * dy;
+  }
+  if (sxx === 0 || syy === 0) return 0;
+  return sxy / Math.sqrt(sxx * syy);
+}
+function erf(x) {
+  const sign = x >= 0 ? 1 : -1; x = Math.abs(x);
+  const a1 = 0.254829592, a2 = -0.284496736, a3 = 1.421413741,
+    a4 = -1.453152027, a5 = 1.061405429, p = 0.3275911;
+  const t = 1 / (1 + p * x);
+  const y = 1 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * Math.exp(-x * x);
+  return sign * y;
+}
+function normCDF(z) { return 0.5 * (1 + erf(z / Math.SQRT2)); }
+function pValueFromR(r, n) {
+  if (n < 5) return 1;
+  const rr = Math.max(Math.min(r, 0.999999), -0.999999);
+  const z = 0.5 * Math.log((1 + rr) / (1 - rr)) * Math.sqrt(n - 3);
+  return 2 * (1 - normCDF(Math.abs(z)));
+}
+function randInt(n) { return Math.floor(Math.random() * n); }
+
+function solveLinear(A, b) {
+  const n = b.length;
+  const M = A.map((row, i) => [...row, b[i]]);
+  for (let col = 0; col < n; col++) {
+    let piv = col;
+    for (let r = col + 1; r < n; r++) if (Math.abs(M[r][col]) > Math.abs(M[piv][col])) piv = r;
+    [M[col], M[piv]] = [M[piv], M[col]];
+    if (Math.abs(M[col][col]) < 1e-10) continue;
+    for (let r = 0; r < n; r++) {
+      if (r === col) continue;
+      const factor = M[r][col] / M[col][col];
+      for (let c = col; c <= n; c++) M[r][c] -= factor * M[col][c];
+    }
+  }
+  return M.map((row, i) => (Math.abs(row[i]) < 1e-10 ? 0 : row[n] / row[i]));
+}
+function multipleRegressionResidualStd(predictorCols, rows, targetCol) {
+  const k = predictorCols.length;
+  if (k === 0) {
+    const y = rows.map((r) => parseFloat(r[targetCol]));
+    return stddev(y);
+  }
+  const X = rows.map((r) => [1, ...predictorCols.map((c) => parseFloat(r[c]))]);
+  const y = rows.map((r) => parseFloat(r[targetCol]));
+  const p = k + 1;
+  const XtX = Array.from({ length: p }, () => Array(p).fill(0));
+  const Xty = Array(p).fill(0);
+  for (let i = 0; i < X.length; i++) {
+    for (let a = 0; a < p; a++) {
+      Xty[a] += X[i][a] * y[i];
+      for (let b = 0; b < p; b++) XtX[a][b] += X[i][a] * X[i][b];
+    }
+  }
+  const beta = solveLinear(XtX, Xty);
+  const residuals = X.map((row, i) => y[i] - row.reduce((s, v, j) => s + v * beta[j], 0));
+  const df = Math.max(X.length - p, 1);
+  const sse = residuals.reduce((s, r) => s + r * r, 0);
+  return Math.sqrt(sse / df);
+}
+
+// ================= sample data (fallback demo) =================
+function randn() {
+  let u = 0, v = 0;
+  while (u === 0) u = Math.random();
+  while (v === 0) v = Math.random();
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+}
+const ENV_DEFS = [
+  { name: "LINE-A_야간", type: "injection" }, { name: "LINE-A_주간", type: "injection" },
+  { name: "LINE-B_야간", type: "injection" }, { name: "LINE-B_주간", type: "injection" },
+  { name: "LINE-C_야간", type: "cnc" }, { name: "LINE-C_주간", type: "cnc" },
+  { name: "LINE-D_야간", type: "cnc" }, { name: "LINE-D_주간", type: "cnc" },
+];
+const KNOWN_VARS = ["설비이상알람건수", "CT이탈도", "정지시간_분", "압축공기사용량_Nm3", "최대수요전력_kW", "CO2배출량_tCO2eq"];
+const TARGET_R = {
+  injection: { 설비이상알람건수: 0.5, CT이탈도: 0.45, 정지시간_분: 0.4, 압축공기사용량_Nm3: -0.35, 최대수요전력_kW: 0.02, CO2배출량_tCO2eq: 0.02 },
+  cnc: { 설비이상알람건수: 0.48, CT이탈도: 0.42, 정지시간_분: -0.45, 압축공기사용량_Nm3: 0.4, 최대수요전력_kW: 0.02, CO2배출량_tCO2eq: 0.02 },
+};
+const RAW_SCALE = {
+  설비이상알람건수: { mean: 5, sd: 2 }, CT이탈도: { mean: 0.5, sd: 0.3 },
+  정지시간_분: { mean: 20, sd: 8 }, 압축공기사용량_Nm3: { mean: 120, sd: 30 },
+  최대수요전력_kW: { mean: 250, sd: 40 }, CO2배출량_tCO2eq: { mean: 15, sd: 5 },
+};
+function generateSampleData() {
+  const rows = []; const n = 150;
+  ENV_DEFS.forEach((env) => {
+    for (let i = 0; i < n; i++) {
+      const z = {}; KNOWN_VARS.forEach((v) => { z[v] = randn(); });
+      const noise = randn() * 0.8;
+      let ysum = 0; KNOWN_VARS.forEach((v) => { ysum += TARGET_R[env.type][v] * z[v]; });
+      const defectRate = Math.max(0.1, 2 + (ysum + noise) * 1.2);
+      const row = { ENV: env.name, 불량률: Number(defectRate.toFixed(3)) };
+      KNOWN_VARS.forEach((v) => {
+        const s = RAW_SCALE[v];
+        row[v] = Number((z[v] * s.sd + s.mean).toFixed(2));
+      });
+      rows.push(row);
+    }
+  });
+  return rows;
+}
+
+// ================= column detection =================
+const ENV_ALIASES = ["환경", "environment", "line", "라인", "env"];
+const TARGET_ALIASES = ["불량률", "defect_rate", "defectrate", "불량율"];
+const EXCLUDE_SUBSTR = ["불량", "양품", "가동률", "oee", "수량", "요금", "원단위", "id", "코드", "일자", "구분", "유형", "실제ct", "이론ct", "부하시간", "전력사용량", "역률"];
+
+function detectColumns(rows) {
+  if (!rows || !rows.length) return null;
+  const cols = Object.keys(rows[0]);
+  const envCol = cols.find((c) => ENV_ALIASES.includes(c.trim().toLowerCase()));
+  const targetCol = cols.find((c) => TARGET_ALIASES.includes(c.trim().toLowerCase()));
+  if (!envCol || !targetCol) return null;
+  const known = KNOWN_VARS.filter((v) => cols.includes(v));
+  let varCols;
+  if (known.length >= 2) {
+    varCols = known;
+  } else {
+    varCols = cols.filter((c) => {
+      if (c === envCol || c === targetCol) return false;
+      const lc = c.toLowerCase();
+      if (EXCLUDE_SUBSTR.some((b) => lc.includes(b))) return false;
+      return rows.every((r) => r[c] === "" || r[c] === null || typeof r[c] === "number" || !isNaN(parseFloat(r[c])));
+    });
+  }
+  return { envCol, targetCol, varCols };
+}
+
+// ================= core analysis =================
+function analyze(rows, envCol, targetCol, varCols, thresholds) {
+  const groups = {};
+  rows.forEach((r) => {
+    const e = r[envCol];
+    if (!groups[e]) groups[e] = [];
+    groups[e].push(r);
+  });
+  const environments = Object.keys(groups);
+
+  const perVar = {};
+  varCols.forEach((v) => {
+    perVar[v] = environments.map((env) => {
+      const g = groups[env];
+      const x = g.map((r) => parseFloat(r[v])).filter((n) => !isNaN(n));
+      const y = g.map((r) => parseFloat(r[targetCol])).filter((n) => !isNaN(n));
+      const len = Math.min(x.length, y.length);
+      const r = len >= 5 ? pearson(x.slice(0, len), y.slice(0, len)) : 0;
+      const p = len >= 5 ? pValueFromR(r, len) : 1;
+      return { env, r, p, n: len };
+    });
+  });
+
+  const requiredSigEnvs = thresholds.sigEnvCount ?? Math.ceil(environments.length / 2);
+  const classifications = {};
+  varCols.forEach((v) => {
+    const stats = perVar[v];
+    const sig = stats.filter((s) => s.p < thresholds.pValue);
+    let label, cv = null;
+    if (sig.length < requiredSigEnvs) {
+      label = "무관";
+    } else {
+      const coeffs = sig.map((s) => s.r);
+      const meanAbs = mean(coeffs.map(Math.abs));
+      const sd = stddev(coeffs);
+      cv = meanAbs === 0 ? Infinity : sd / meanAbs;
+      label = cv > thresholds.cv ? "환경의존" : "유관";
+    }
+    classifications[v] = { label, sigCount: sig.length, cv, avgP: mean(stats.map((s) => s.p)) };
+  });
+
+  const keptVars = varCols.filter((v) => classifications[v].label !== "무관");
+  const residStds = environments.map((env) => multipleRegressionResidualStd(keptVars, groups[env], targetCol));
+  const noiseStd = mean(residStds);
+
+  const sampleSizes = environments.map((e) => groups[e].length);
+  return {
+    environments, perVar, classifications, requiredSigEnvs, groups,
+    dataConditions: {
+      envCount: environments.length,
+      minSampleSize: Math.min(...sampleSizes),
+      totalRows: rows.length,
+      noiseStd,
+    },
+  };
+}
+
+function bootstrapStability(groups, targetCol, varCols, thresholds, classifications, resamples = 12) {
+  const environments = Object.keys(groups);
+  const requiredSigEnvs = thresholds.sigEnvCount ?? Math.ceil(environments.length / 2);
+  const agreement = {};
+  varCols.forEach((v) => {
+    let matches = 0;
+    for (let b = 0; b < resamples; b++) {
+      const stats = environments.map((env) => {
+        const g = groups[env];
+        const idx = g.map(() => randInt(g.length));
+        const x = idx.map((i) => parseFloat(g[i][v]));
+        const y = idx.map((i) => parseFloat(g[i][targetCol]));
+        const r = pearson(x, y);
+        const p = pValueFromR(r, x.length);
+        return { r, p };
+      });
+      const sig = stats.filter((s) => s.p < thresholds.pValue);
+      let label;
+      if (sig.length < requiredSigEnvs) label = "무관";
+      else {
+        const coeffs = sig.map((s) => s.r);
+        const meanAbs = mean(coeffs.map(Math.abs));
+        const sd = stddev(coeffs);
+        const cv = meanAbs === 0 ? Infinity : sd / meanAbs;
+        label = cv > thresholds.cv ? "환경의존" : "유관";
+      }
+      if (label === classifications[v].label) matches++;
+    }
+    agreement[v] = matches / resamples;
+  });
+  return agreement;
+}
+
+const LABEL_COLOR = { 유관: "#35D0C4", 환경의존: "#F5A623", 무관: "#5B6B82" };
+const LABEL_BG = { 유관: "rgba(53,208,196,0.10)", 환경의존: "rgba(245,166,35,0.10)", 무관: "rgba(91,107,130,0.10)" };
+const varColors = ["#35D0C4", "#F5A623", "#7B8FF5", "#E56B9F", "#5B6B82", "#C9A227", "#4ADE80", "#FF8C61"];
+
+function StatusBadge({ pass }) {
+  return pass ? (
+    <span style={{ display: "flex", alignItems: "center", gap: 4, color: "#4ADE80", fontSize: 12, fontWeight: 600 }}>
+      <Icon name="check" size={14} /> PASS
+    </span>
+  ) : (
+    <span style={{ display: "flex", alignItems: "center", gap: 4, color: "#FF6B6B", fontSize: 12, fontWeight: 600 }}>
+      <Icon name="x" size={14} /> FAIL
+    </span>
+  );
+}
+
+const GLOBAL_STYLE = `
+  .cpfu-mono { font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Consolas, monospace; }
+  .cpfu-panel { background: #101F35; border: 1px solid rgba(255,255,255,0.08); border-radius: 6px; }
+  .cpfu-btn { background: #101F35; border: 1px solid rgba(255,255,255,0.14); color: #E7ECF3; border-radius: 5px;
+         padding: 9px 14px; font-size: 13px; cursor: pointer; display: flex; align-items: center; gap: 7px;
+         transition: border-color 0.15s, background 0.15s; font-family: inherit; }
+  .cpfu-btn:hover { border-color: rgba(255,255,255,0.32); background: #14253E; }
+  .cpfu-root input[type=range] { accent-color: #35D0C4; width: 100%; }
+  .cpfu-corner { position: relative; }
+  .cpfu-corner::before, .cpfu-corner::after { content: ''; position: absolute; width: 10px; height: 10px; border-color: rgba(255,255,255,0.25); }
+  .cpfu-corner::before { top: -1px; left: -1px; border-top: 1px solid; border-left: 1px solid; }
+  .cpfu-corner::after { bottom: -1px; right: -1px; border-bottom: 1px solid; border-right: 1px solid; }
+  @keyframes cpfu-blink { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+`;
+
+const ANALYZE_STEPS = [
+  "CSV 데이터 파싱 중",
+  "환경별 회귀계수 도출 중",
+  "유의확률(p-value) 계산 중",
+  "변동계수 기반 변수 분류 중",
+  "최소 데이터 조건 검증 중",
+  "부트스트랩 안정성 검증 중",
+];
+
+function CPFUApp() {
+  const [page, setPage] = useState("upload");
+  const [rows, setRows] = useState(null);
+  const [columns, setColumns] = useState(null);
+  const [fileName, setFileName] = useState("");
+  const [error, setError] = useState(null);
+  const [dragOver, setDragOver] = useState(false);
+  const [thresholds, setThresholds] = useState({ pValue: 0.05, cv: 0.5, sigEnvCount: 4 });
+  const [analysis, setAnalysis] = useState(null);
+  const [stability, setStability] = useState(null);
+  const [progress, setProgress] = useState(0);
+  const [stepIdx, setStepIdx] = useState(0);
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const fileInputRef = useRef(null);
+
+  const runAnalysisPipeline = useCallback((data, cols, currentThresholds) => {
+    setPage("analyzing");
+    setProgress(0);
+    setStepIdx(0);
+    let step = 0;
+    const timer = setInterval(() => {
+      step += 1;
+      setStepIdx(Math.min(step, ANALYZE_STEPS.length - 1));
+      setProgress((p) => Math.min(p + 16 + Math.random() * 6, 96));
+    }, 260);
+
+    setTimeout(() => {
+      const result = analyze(data, cols.envCol, cols.targetCol, cols.varCols, currentThresholds);
+      const agree = bootstrapStability(result.groups, cols.targetCol, cols.varCols, currentThresholds, result.classifications, 12);
+      clearInterval(timer);
+      setProgress(100);
+      setAnalysis(result);
+      setStability(agree);
+      setTimeout(() => setPage("dashboard"), 260);
+    }, 1650);
+  }, []);
+
+  const loadFile = useCallback((file) => {
+    if (!file) return;
+    Papa.parse(file, {
+      header: true, dynamicTyping: true, skipEmptyLines: true,
+      complete: (results) => {
+        const data = results.data.filter((r) => Object.keys(r).length > 1);
+        const cols = detectColumns(data);
+        if (!cols) {
+          setError('CSV에서 환경 열(예: ENV, 환경)과 불량률 열을 찾을 수 없습니다. 열 이름을 확인해주세요.');
+          return;
+        }
+        if (cols.varCols.length === 0) {
+          setError("분석할 수 있는 숫자형 공정변수 열이 없습니다.");
+          return;
+        }
+        setError(null);
+        setRows(data);
+        setColumns(cols);
+        setFileName(file.name);
+        runAnalysisPipeline(data, cols, thresholds);
+      },
+      error: () => setError("CSV 파일을 읽는 중 오류가 발생했습니다."),
+    });
+  }, [thresholds, runAnalysisPipeline]);
+
+  const loadSample = useCallback(() => {
+    const data = generateSampleData();
+    const cols = detectColumns(data);
+    setError(null);
+    setRows(data);
+    setColumns(cols);
+    setFileName("샘플 데이터 (자동 생성)");
+    runAnalysisPipeline(data, cols, thresholds);
+  }, [thresholds, runAnalysisPipeline]);
+
+  const rerunWithThresholds = useCallback((newThresholds) => {
+    setThresholds(newThresholds);
+    if (!rows || !columns) return;
+    const result = analyze(rows, columns.envCol, columns.targetCol, columns.varCols, newThresholds);
+    const agree = bootstrapStability(result.groups, columns.targetCol, columns.varCols, newThresholds, result.classifications, 12);
+    setAnalysis(result);
+    setStability(agree);
+  }, [rows, columns]);
+
+  const reset = useCallback(() => {
+    setPage("upload"); setRows(null); setColumns(null); setAnalysis(null);
+    setStability(null); setFileName(""); setError(null);
+  }, []);
+
+  const chartData = useMemo(() => {
+    if (!analysis || !columns) return [];
+    return analysis.environments.map((env) => {
+      const row = { environment: env };
+      columns.varCols.forEach((v) => {
+        const stat = analysis.perVar[v].find((s) => s.env === env);
+        row[v] = stat ? Number(stat.r.toFixed(3)) : 0;
+      });
+      return row;
+    });
+  }, [analysis, columns]);
+
+  const pChartData = useMemo(() => {
+    if (!analysis || !columns) return [];
+    return analysis.environments.map((env) => {
+      const row = { environment: env };
+      columns.varCols.forEach((v) => {
+        const stat = analysis.perVar[v].find((s) => s.env === env);
+        row[v] = stat ? Number(stat.p.toFixed(3)) : 1;
+      });
+      return row;
+    });
+  }, [analysis, columns]);
+
+  const grouped = { 유관: [], 환경의존: [], 무관: [] };
+  if (analysis && columns) columns.varCols.forEach((v) => grouped[analysis.classifications[v].label].push(v));
+
+  const conditions = analysis ? [
+    { label: "분석환경 수", value: `${analysis.dataConditions.envCount}개`, sub: "최소 4개 이상", pass: analysis.dataConditions.envCount >= 4 },
+    { label: "환경당 표본 수", value: `${analysis.dataConditions.minSampleSize}행`, sub: "최소 100행 이상", pass: analysis.dataConditions.minSampleSize >= 100 },
+    { label: "노이즈 표준편차", value: `${analysis.dataConditions.noiseStd.toFixed(2)}%p`, sub: "0.2%p 이하", pass: analysis.dataConditions.noiseStd <= 0.2 },
+  ] : [];
+
+  return (
+    <div className="cpfu-root" style={{
+      fontFamily: "'Inter', -apple-system, 'Segoe UI', sans-serif",
+      background: "#0A1628", color: "#E7ECF3", minHeight: "100vh",
+      backgroundImage: "linear-gradient(rgba(255,255,255,0.025) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.025) 1px, transparent 1px)",
+      backgroundSize: "28px 28px",
+    }}>
+      <style>{GLOBAL_STYLE}</style>
+
+      {page === "upload" && (
+        <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 32 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 6 }}>
+            <Icon name="factory" size={26} color="#35D0C4" />
+            <span style={{ fontSize: 30, fontWeight: 700, letterSpacing: 1 }}>CPFU</span>
+          </div>
+          <div style={{ fontSize: 13, color: "#8CA0B8", marginBottom: 40, textAlign: "center" }}>
+            Critical Parameter Filtering Unit — 신규 라인 구축 전, 핵심 공정변수를 데이터로 판별합니다
+          </div>
+
+          <div
+            onClick={() => fileInputRef.current && fileInputRef.current.click()}
+            onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+            onDragLeave={() => setDragOver(false)}
+            onDrop={(e) => { e.preventDefault(); setDragOver(false); loadFile(e.dataTransfer.files[0]); }}
+            style={{
+              width: 460, maxWidth: "90%", height: 220, borderRadius: 10, cursor: "pointer",
+              border: `2px dashed ${dragOver ? "#35D0C4" : "rgba(255,255,255,0.25)"}`,
+              background: dragOver ? "rgba(53,208,196,0.06)" : "transparent",
+              display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 14,
+              transition: "border-color 0.15s, background 0.15s",
+            }}
+          >
+            <div style={{ width: 46, height: 46, borderRadius: "50%", background: "rgba(53,208,196,0.12)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+              <Icon name="upload" size={22} color="#35D0C4" />
+            </div>
+            <div style={{ fontSize: 14, fontWeight: 500 }}>CSV 업로드</div>
+            <div style={{ fontSize: 12, color: "#8CA0B8" }}>클릭하거나 파일을 끌어다 놓으세요</div>
+          </div>
+          <input ref={fileInputRef} type="file" accept=".csv" style={{ display: "none" }}
+            onChange={(e) => loadFile(e.target.files[0])} />
+
+          {error && (
+            <div style={{ marginTop: 16, fontSize: 12, color: "#FF6B6B", maxWidth: 420, textAlign: "center" }}>{error}</div>
+          )}
+
+          <button className="cpfu-btn" style={{ marginTop: 28, fontSize: 12 }} onClick={loadSample}>
+            <Icon name="fileSheet" size={13} /> 샘플 데이터로 체험하기
+          </button>
+        </div>
+      )}
+
+      {page === "analyzing" && (
+        <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 32 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 28 }}>
+            <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#35D0C4", animation: "cpfu-blink 1.2s infinite" }} />
+            <span style={{ fontSize: 18, fontWeight: 600 }}>분석 중</span>
+          </div>
+          <div style={{ width: 420, maxWidth: "80%", height: 14, borderRadius: 999, background: "rgba(255,255,255,0.08)", overflow: "hidden", border: "1px solid rgba(255,255,255,0.1)" }}>
+            <div style={{ height: "100%", width: `${progress}%`, background: "linear-gradient(90deg, #1D9E75, #35D0C4)", transition: "width 0.3s ease" }} />
+          </div>
+          <div className="cpfu-mono" style={{ marginTop: 12, fontSize: 13, color: "#35D0C4" }}>{Math.round(progress)}%</div>
+          <div style={{ marginTop: 14, fontSize: 12, color: "#8CA0B8" }}>{ANALYZE_STEPS[stepIdx]}...</div>
+        </div>
+      )}
+
+      {page === "dashboard" && analysis && (
+        <div style={{ padding: 20 }}>
+          <div className="cpfu-panel cpfu-corner" style={{ padding: "16px 20px", marginBottom: 16, display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+              <button className="cpfu-btn" style={{ padding: 8 }} onClick={reset} aria-label="새 파일 분석">
+                <Icon name="arrowLeft" size={15} />
+              </button>
+              <div style={{ width: 34, height: 34, borderRadius: 6, background: "rgba(53,208,196,0.12)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                <Icon name="factory" size={17} color="#35D0C4" />
+              </div>
+              <div>
+                <div style={{ fontSize: 15, fontWeight: 600 }}>CPFU Dashboard</div>
+                <div style={{ fontSize: 11, color: "#8CA0B8" }}>Critical Parameter Filtering Unit</div>
+              </div>
+            </div>
+            <div className="cpfu-mono" style={{ fontSize: 12, color: "#8CA0B8", display: "flex", gap: 18, flexWrap: "wrap" }}>
+              <span>대상 파일: <span style={{ color: "#E7ECF3" }}>{fileName}</span></span>
+              <span>총 행 수: <span style={{ color: "#E7ECF3" }}>{analysis.dataConditions.totalRows.toLocaleString()}</span></span>
+              <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <span style={{ width: 7, height: 7, borderRadius: "50%", background: "#4ADE80", display: "inline-block" }} /> 분석 완료
+              </span>
+            </div>
+          </div>
+
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 12, marginBottom: 16 }}>
+            {conditions.map((c) => (
+              <div key={c.label} className="cpfu-panel" style={{ padding: 14 }}>
+                <div style={{ fontSize: 11, color: "#8CA0B8", marginBottom: 6 }}>{c.label}</div>
+                <div className="cpfu-mono" style={{ fontSize: 20, fontWeight: 600, marginBottom: 4 }}>{c.value}</div>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <span style={{ fontSize: 11, color: "#5B6B82" }}>{c.sub}</span>
+                  <StatusBadge pass={c.pass} />
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div className="cpfu-panel" style={{ padding: 18, marginBottom: 16 }}>
+            <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 14 }}>공정변수 분류결과</div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 12 }}>
+              {["유관", "환경의존", "무관"].map((label) => (
+                <div key={label} style={{ background: LABEL_BG[label], border: `1px solid ${LABEL_COLOR[label]}33`, borderRadius: 6, padding: 14, minHeight: 120 }}>
+                  <div style={{ fontSize: 12, color: LABEL_COLOR[label], fontWeight: 600, marginBottom: 10 }}>
+                    {label}변수 ({grouped[label].length})
+                  </div>
+                  {grouped[label].length === 0 ? (
+                    <div style={{ fontSize: 12, color: "#5B6B82" }}>해당 없음</div>
+                  ) : grouped[label].map((v) => (
+                    <div key={v} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13, marginBottom: 6 }}>
+                      <Icon name="chevronRight" size={13} color={LABEL_COLOR[label]} /> {v}
+                    </div>
+                  ))}
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="cpfu-panel" style={{ padding: 16, marginBottom: 16 }}>
+            <button
+              onClick={() => setShowAdvanced((s) => !s)}
+              style={{ background: "none", border: "none", color: "#8CA0B8", fontSize: 12, cursor: "pointer", display: "flex", alignItems: "center", gap: 6, padding: 0, fontFamily: "inherit" }}
+            >
+              <Icon name="sliders" size={13} /> 판별 기준 설정
+              <span style={{ display: "inline-flex", transform: showAdvanced ? "rotate(180deg)" : "none", transition: "transform 0.15s" }}>
+                <Icon name="chevronDown" size={13} />
+              </span>
+            </button>
+            {showAdvanced && (
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 20, marginTop: 16 }}>
+                <div>
+                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 4 }}>
+                    <span>유의확률(p) 기준</span><span className="cpfu-mono" style={{ color: "#35D0C4" }}>{thresholds.pValue}</span>
+                  </div>
+                  <input type="range" min="0.01" max="0.10" step="0.01" value={thresholds.pValue}
+                    onChange={(e) => rerunWithThresholds({ ...thresholds, pValue: parseFloat(e.target.value) })} />
+                </div>
+                <div>
+                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 4 }}>
+                    <span>변동계수(CV) 기준</span><span className="cpfu-mono" style={{ color: "#F5A623" }}>{thresholds.cv}</span>
+                  </div>
+                  <input type="range" min="0.1" max="1.0" step="0.05" value={thresholds.cv}
+                    onChange={(e) => rerunWithThresholds({ ...thresholds, cv: parseFloat(e.target.value) })} />
+                </div>
+                <div>
+                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 4 }}>
+                    <span>유의 환경 최소 개수</span><span className="cpfu-mono" style={{ color: "#7B8FF5" }}>{thresholds.sigEnvCount}</span>
+                  </div>
+                  <input type="range" min="1" max={analysis.environments.length} step="1" value={thresholds.sigEnvCount}
+                    onChange={(e) => rerunWithThresholds({ ...thresholds, sigEnvCount: parseInt(e.target.value) })} />
+                </div>
+                <button className="cpfu-btn" style={{ justifyContent: "center", fontSize: 12 }}
+                  onClick={() => rerunWithThresholds({ pValue: 0.05, cv: 0.5, sigEnvCount: Math.ceil(analysis.environments.length / 2) })}>
+                  <Icon name="rotate" size={13} /> 기본값으로
+                </button>
+              </div>
+            )}
+          </div>
+
+          <div className="cpfu-panel" style={{ padding: 18, marginBottom: 16 }}>
+            <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 4 }}>환경별 표준화 회귀계수(상관계수)</div>
+            <div style={{ fontSize: 11, color: "#8CA0B8", marginBottom: 14 }}>변수별로 환경 간 값이 비슷하면 유관, 크게 달라지면 환경의존 변수입니다.</div>
+            <div style={{ height: 280 }}>
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={chartData}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)" />
+                  <XAxis dataKey="environment" tick={{ fill: "#8CA0B8", fontSize: 10 }} angle={-20} textAnchor="end" height={50} />
+                  <YAxis tick={{ fill: "#8CA0B8", fontSize: 11 }} />
+                  <Tooltip contentStyle={{ background: "#101F35", border: "1px solid rgba(255,255,255,0.15)", fontSize: 12 }} />
+                  <Legend wrapperStyle={{ fontSize: 11 }} />
+                  {columns.varCols.map((v, i) => (
+                    <Bar key={v} dataKey={v} fill={varColors[i % varColors.length]} radius={[2, 2, 0, 0]} />
+                  ))}
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          </div>
+
+          <div className="cpfu-panel" style={{ padding: 18, marginBottom: 16 }}>
+            <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 4 }}>환경별 유의확률(p-value)</div>
+            <div style={{ fontSize: 11, color: "#8CA0B8", marginBottom: 14 }}>기준선({thresholds.pValue}) 아래로 내려간 환경만 유의하다고 판단합니다.</div>
+            <div style={{ height: 280 }}>
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={pChartData}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)" />
+                  <XAxis dataKey="environment" tick={{ fill: "#8CA0B8", fontSize: 10 }} angle={-20} textAnchor="end" height={50} />
+                  <YAxis tick={{ fill: "#8CA0B8", fontSize: 11 }} domain={[0, 1]} />
+                  <Tooltip contentStyle={{ background: "#101F35", border: "1px solid rgba(255,255,255,0.15)", fontSize: 12 }} />
+                  <Legend wrapperStyle={{ fontSize: 11 }} />
+                  <ReferenceLine y={thresholds.pValue} stroke="#FF6B6B" strokeDasharray="4 4" />
+                  {columns.varCols.map((v, i) => (
+                    <Bar key={v} dataKey={v} fill={varColors[i % varColors.length]} radius={[2, 2, 0, 0]} />
+                  ))}
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          </div>
+
+          <div className="cpfu-panel" style={{ padding: 18, overflowX: "auto" }}>
+            <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 14 }}>변수별 최종 판정</div>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+              <thead>
+                <tr style={{ borderBottom: "1px solid rgba(255,255,255,0.1)", color: "#8CA0B8", textAlign: "left" }}>
+                  <th style={{ padding: "6px 8px" }}>공정 변수</th>
+                  <th style={{ padding: "6px 8px" }}>최종 판정</th>
+                  <th style={{ padding: "6px 8px" }}>유의 환경 수</th>
+                  <th style={{ padding: "6px 8px" }}>변동계수(CV)</th>
+                  <th style={{ padding: "6px 8px" }}>평균 p-value</th>
+                  <th style={{ padding: "6px 8px" }}>안정성</th>
+                </tr>
+              </thead>
+              <tbody>
+                {columns.varCols.map((v) => {
+                  const c = analysis.classifications[v];
+                  return (
+                    <tr key={v} style={{ borderBottom: "1px solid rgba(255,255,255,0.05)" }}>
+                      <td style={{ padding: "8px" }}>{v}</td>
+                      <td style={{ padding: "8px" }}><span style={{ color: LABEL_COLOR[c.label], fontWeight: 600 }}>{c.label}</span></td>
+                      <td className="cpfu-mono" style={{ padding: "8px" }}>{c.sigCount} / {analysis.environments.length}</td>
+                      <td className="cpfu-mono" style={{ padding: "8px" }}>{c.cv === null ? "—" : c.cv === Infinity ? "∞" : c.cv.toFixed(2)}</td>
+                      <td className="cpfu-mono" style={{ padding: "8px" }}>{c.avgP.toFixed(3)}</td>
+                      <td className="cpfu-mono" style={{ padding: "8px" }}>{stability ? `${Math.round(stability[v] * 100)}%` : "—"}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<CPFUApp />);
+</script>
+</body>
+</html>
